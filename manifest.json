@@ -1,0 +1,17 @@
+{
+    "display_name": "VectFox",
+    "loading_order": 101,
+    "requires": [],
+    "optional": ["embeddings"],
+    "generate_interceptor": "vectfox_rearrangeChat",
+    "js": "index.js",
+    "css": "vectfox.css",
+    "author": "Kritbalde",
+    "version": "3.6.9",
+    "homePage": "https://github.com/KritBlade/VectFox",
+    "description": "Advanced RAG system with temporal decay, importance weighting, and intelligent chunking",
+    "auto_update": true,
+    "hooks": {
+        "update": "onUpdate"
+    }
+}
