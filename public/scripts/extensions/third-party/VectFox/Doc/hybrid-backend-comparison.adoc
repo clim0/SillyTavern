@@ -1,0 +1,441 @@
+= Hybrid Search: Client-Side vs Native (Qdrant/hdrant) Comparison
+:toc: left
+:toclevels: 3
+
+== Overview
+
+When "Prefer Native Backend Hybrid" is enabled in the GUI, the system routes
+through two fundamentally different paths depending on the backend:
+
+* *Standard backend (Vectra/ST-native)* → client-side hybrid in `hybrid-search.js`
+* *Qdrant backend (hdrant)* → server-side hybrid via the Similharity plugin's
+  `/chunks/hybrid-query` endpoint, which now calls **Qdrant's native
+  dense+sparse-vector hybrid API**: a single `POST /collections/{c}/points/query`
+  with `prefetch` over the dense vector and a named `text_sparse` sparse vector
+  (BM25-IDF computed server-side by Qdrant), fused server-side via RRF
+
+This document compares the two paths in detail.
+
+== At a Glance
+
+[cols="1,2,2",options="header"]
+|===
+| Area | Standard client-side hybrid | hdrant/Qdrant server-side hybrid
+
+| Vector search
+| Uses standard backend vector query
+| Uses Qdrant dense vector search (prefetch leg)
+
+| Keyword search scope
+| Only over vector candidates already returned
+| Sparse-vector ANN against the full Qdrant corpus
+
+| Can find keyword-only matches?
+| Mostly no
+| Yes — sparse prefetch is independent of the dense prefetch
+
+| Uses stored sparse vectors?
+| No — there is no sparse index on the Standard backend
+| Yes — `text_sparse` named sparse vector with `modifier: 'idf'`
+
+| Candidate recall
+| Limited by vector topK × 3, max 100
+| Top `prefetchLimit` (default topK × 4) from each prefetch leg, fused
+
+| Filtering
+| Mostly after retrieval in EventBase
+| Applied inside each Qdrant prefetch leg (filter on dense and sparse)
+
+| Performance on large collections
+| Browser/client does scoring over candidates; vector backend still limits candidates
+| Single Qdrant request; sparse + dense + fusion all run inside Qdrant
+
+| CJK / exact-name matching
+| Depends on client keyword extractor + BM25 over candidates
+| Sparse vector encoded with the same CJK tokenizer used at ingest (Intl.Segmenter / Jieba / TinySegmenter); BM25 IDF is global
+
+| Score semantics
+| Client RRF with custom display-score recalculation
+| Qdrant returns the fused RRF score directly; no plugin-side rewrite
+
+| Failure mode
+| If vector search misses it, keyword search cannot recover it
+| Sparse leg can recover dense-missed records (and vice versa)
+|===
+
+== Routing Decision (core-vector-api.js, lines 865–893)
+
+[source,javascript]
+----
+const nativeHybridAvailable = backend?.supportsHybridSearch?.() === true;
+const preferNative = settings.hybrid_native_prefer !== false;
+const useHybridPath = (nativeHybridAvailable && preferNative)
+                   || settings.keyword_scoring_method === 'hybrid';
+----
+
+* `StandardBackend.supportsHybridSearch()` returns `false` (inherited default)
+* `QdrantBackend.supportsHybridSearch()` returns `true`
+
+So for the standard backend, `useHybridPath` is only true when
+`keyword_scoring_method === 'hybrid'` is explicitly set. Otherwise it falls
+through to the A1 BM25 re-rank path.
+
+NOTE: The comment block at [core/core-vector-api.js:865-870](../core/core-vector-api.js#L865-L870)
+still describes A3 as "fused in plugin code (NOT Qdrant native ...)". That
+comment is stale and predates the native-sparse migration described below —
+A3 is now true native dense+sparse hybrid.
+
+== Path A3: Server-Side Hybrid (Qdrant/hdrant) — Native Dense + Sparse + RRF
+
+=== Flow
+
+1. `queryCollection()` → `hybridSearch()` → `backend.hybridQuery()`
+   ([backends/qdrant.js:753](../backends/qdrant.js#L753))
+2. vectfox encodes the query as a sparse vector via
+   `encodeSparseQuery(searchText)` in [core/sparse-vector-encoder.js](../core/sparse-vector-encoder.js),
+   reusing the CJK-aware `tokenize()` from [core/bm25-scorer.js](../core/bm25-scorer.js).
+   A tokenizer-mode sentinel check runs first (see Tokenizer Lock below).
+3. `QdrantBackend.hybridQuery()` POSTs to `/api/plugins/similharity/chunks/hybrid-query`
+   with `{ searchText, sparseQueryVector: {indices, values}, hybridOptions, ... }`.
+4. The Similharity plugin route ([index.js:1255](../../similharity/index.js#L1255)):
+   a. Embeds the query text on the server (dense vector).
+   b. Calls `qdrantBackend.hybridQueryNative()`
+      ([similharity/qdrant-backend.js:703](../../similharity/qdrant-backend.js#L703))
+      with the dense vector and the supplied sparse vector.
+5. `hybridQueryNative()` issues **one** request:
+   `POST /collections/{c}/points/query` with body:
++
+[source,json]
+----
+{
+  "prefetch": [
+    { "query": <denseVector>,                    "limit": prefetchLimit },
+    { "query": <sparseVector>, "using": "text_sparse", "limit": prefetchLimit }
+  ],
+  "query": { "fusion": "rrf" },
+  "limit": topK,
+  "with_payload": true
+}
+----
+6. Qdrant runs both prefetch legs, computes BM25 server-side on the sparse leg
+   (using global IDF via the `modifier: 'idf'` declared on the collection),
+   fuses the two ranked lists via RRF inside Qdrant, and returns the top `topK`
+   points with payload.
+
+=== Key Characteristics
+
+* **Single Qdrant request** — one `/query` call replaces the old
+  `search + scroll + plugin-JS fusion` flow.
+* **Native server-side fusion** — RRF is performed by Qdrant, not by plugin
+  JavaScript. The plugin no longer computes BM25, IDF, or fusion bonuses.
+* **Native sparse vectors stored** — collections declare
+  `sparse_vectors: { text_sparse: { modifier: 'idf' } }` at creation
+  ([similharity/qdrant-backend.js:240](../../similharity/qdrant-backend.js#L240)).
+  Each point upserts both `''` (dense) and `text_sparse` (sparse) vectors.
+* **Global BM25 IDF** — Qdrant's `modifier: 'idf'` makes IDF a true full-corpus
+  statistic, not a candidate-subset approximation.
+* **Server-side dense embedding** — the plugin generates the query embedding;
+  no client-side embedding cost (unless the source is webllm/koboldcpp).
+* **Client-side sparse encoding** — vectfox tokenizes the query text in the
+  browser so the CJK tokenizer mode matches what was used at ingest.
+
+=== Tokenizer Lock
+
+The sparse vectors stored in Qdrant bake in the CJK tokenizer mode that was
+active at upsert. A mode change between upsert and query silently breaks BM25
+matching, so on each query vectfox reads the collection's sentinel point
+(`type: "_vectfox_meta"`) via `detectTokenizerMismatch()` and prompts the
+user to revert the setting or rebuild the collection if the modes differ
+([backends/qdrant.js:771-792](../backends/qdrant.js#L771-L792)).
+
+=== What About DBSF?
+
+Qdrant supports two fusion methods, RRF and DBSF (Distribution-Based Score
+Fusion). The plugin library function `hybridQueryNative` accepts
+`options.fusion: 'rrf' | 'dbsf'`
+([similharity/qdrant-backend.js:707](../../similharity/qdrant-backend.js#L707)),
+but the `/chunks/hybrid-query` route currently hardcodes
+`fusion: 'rrf'`
+([similharity/index.js:1298](../../similharity/index.js#L1298)).
+
+The vectfox side reads `settings.hybrid_fusion_method` for logging and
+client-side fusion ([core/hybrid-search.js:80](../core/hybrid-search.js#L80)),
+but on the A3 path the value is **not propagated to the plugin route** — only
+`fusionMethod` is sent inside `hybridOptions`, and the route ignores it in
+favor of the hardcoded `'rrf'`. To enable DBSF end-to-end:
+
+1. Forward `options.fusion` (or `hybridOptions.fusionMethod`) in the route
+   instead of hardcoding `'rrf'`.
+2. Expose the choice in the vectfox GUI / settings so users can pick.
+
+=== Reranking Pipelines
+
+EventBase has its own re-ranker that weights cosine + importance + persist +
+recency. When `eventbase_native_rerank = true` (Qdrant ≥ 1.13, default), this
+formula runs **server-side inside the Qdrant `/points/query` call** via a
+`formula` query wrapping the `prefetch` — see Section 6a. When
+`eventbase_native_rerank = false`, the same formula runs client-side in
+JavaScript after retrieval
+([core/eventbase-retrieval.js](../core/eventbase-retrieval.js)) — see Section 6b.
+
+NOTE: An external cross-encoder rerank stage (the former BananaBread `/rerank`
+proxy) was removed 2026-06-13. The EventBase weighted re-ranker described above
+is the only reranking path that remains.
+
+== Path A2: Client-Side Hybrid (Standard Backend)
+
+=== Flow
+
+1. `queryCollection()` → `hybridSearch()` → `clientSideHybridSearch()`
+2. The client:
+   a. Calls `backend.queryCollection()` to get **dense vector** results (ANN top-K × 3)
+   b. Builds a BM25 scorer from the returned result set
+   c. Scores each result against the query using BM25
+   d. Fuses the two ranked lists using RRF or weighted combination
+   e. Returns fused results
+
+=== Key Characteristics
+
+* **Two round-trips** (or one if you count the vector query as the primary)
+* **BM25 over ANN top-K only** — BM25 is computed only on the results returned
+  by the dense vector search, not the full corpus
+* **Client-side BM25** — the BM25 scorer is built and applied in JavaScript
+* **No sparse vectors stored** — BM25 is computed on-the-fly from the text
+  content of the ANN results
+* **Client-side fusion** — RRF/weighted combination is computed in JavaScript
+* **`hybrid_fusion_method` setting is honored here** (unlike A3) — RRF vs.
+  weighted combination is selected at fusion time.
+
+== Path A1: BM25 Re-rank (Standard Backend, Default)
+
+When `keyword_scoring_method` is NOT `'hybrid'` and the backend is standard,
+the system uses the A1 path:
+
+1. Dense vector search (ANN) with overfetch
+2. BM25 re-rank of the ANN results using `applyBM25Scoring()`
+3. Weighted combination: `alpha * vectorScore + beta * bm25Score`
+
+This is NOT a true hybrid search — it's a re-ranking of the vector results
+using BM25 as a secondary signal. It cannot surface results that the dense
+vector search missed.
+
+== Where the BM25 in Our Codebase Actually Lives
+
+[cols="2,3,2",options="header"]
+|===
+| Path | Where BM25 runs | Corpus scope
+
+| A1 (client BM25 re-rank)
+| Browser JS, `bm25-scorer.js`
+| ANN top-K only
+
+| A2 (client-side hybrid)
+| Browser JS, `hybrid-search.js`
+| ANN top-K × 3 only
+
+| *A3 (server-side hybrid, what we have)*
+| **Qdrant engine**, native BM25 via `modifier: 'idf'` on the `text_sparse` named sparse vector
+| **Full collection** (global IDF), single `/query` request with dense+sparse prefetch and RRF
+|===
+
+*TL;DR:* A3 is now Qdrant's true dense+sparse-vector hybrid: BM25 runs inside
+Qdrant against the full corpus, dense and sparse prefetches are fused
+server-side via RRF, and the plugin returns the result of one `/query` call
+without any JS-level re-scoring or re-fusion.
+
+== Technical Differences
+
+=== 1. Corpus Coverage
+
+|===
+| Aspect | Client-Side Hybrid (A2) | Server-Side Hybrid (A3)
+| Keyword scope | ANN top-K only (topK × 3) | Sparse-vector ANN against the full collection, top `prefetchLimit` (default topK × 4) per leg
+| Can surface non-dense-ANN results? | No | Yes — the sparse prefetch is an independent ANN over the sparse vector space
+| Recall for keyword-specific queries | Limited by dense ANN recall | Bounded by `prefetchLimit` per leg, but searched globally
+|===
+
+This is the **most significant difference**. In the client-side path, a
+document with high keyword relevance but low vector similarity is never
+considered because it wasn't in the ANN result set. In A3, the sparse leg is
+an independent prefetch over the full collection — a document with high
+keyword (BM25) score is reachable even if it sits far away in dense space.
+
+=== 2. Keyword Matching Quality
+
+|===
+| Aspect | Client-Side Hybrid (A2) | Server-Side Hybrid (A3)
+| Scoring method | BM25 with IDF over ANN results (browser JS) | Native BM25 inside Qdrant via `modifier: 'idf'`
+| IDF accuracy | Poor — IDF is based on a biased ANN subset | Global — IDF is a true full-corpus statistic maintained by Qdrant
+| Tokenization | Client tokenizer applied per-query | Same CJK tokenizer used at ingest and query (locked via sentinel)
+|===
+
+A3's IDF is the genuine corpus IDF that Qdrant maintains across the
+collection, not a subset approximation. The tokenizer-mode lock guarantees
+ingest and query agree on token IDs (FNV-1a / CRC32 hashes of tokenized
+strings).
+
+=== 3. Round-Trips
+
+|===
+| Aspect | Client-Side Hybrid (A2) | Server-Side Hybrid (A3)
+| HTTP requests (client→plugin) | 1 (vector) + 0 (BM25 is client-side) | 1 (plugin handles everything internally)
+| HTTP requests (plugin→Qdrant) | 1 (vector search) | **1** native `/points/query` with prefetch (both legs + fusion in one call)
+| Embedding generation | Server-side (or client-side for webllm/koboldcpp) | Dense: server-side; Sparse: client-side encoder, shipped as `{indices, values}`
+| Latency | Lower (no extra network call) | Comparable — single Qdrant call replaces the old search+scroll+JS-fusion
+|===
+
+A3 is now a single Qdrant request per query (down from search + N scroll
+pages + plugin-JS scoring/fusion in the pre-native implementation).
+
+=== 4. Fusion
+
+|===
+| Aspect | Client-Side Hybrid (A2) | Server-Side Hybrid (A3)
+| Where fusion runs | JavaScript in `hybrid-search.js` | **Qdrant engine** (`query: { fusion: 'rrf' }`)
+| Method | RRF or weighted combination (controlled by `hybrid_fusion_method`) | RRF (hardcoded in route); DBSF supported by `hybridQueryNative` but not exposed
+| Display-score post-processing | Min-max normalization + dual-signal bonus + single-signal penalty | None — Qdrant's fused score is used as-is
+|===
+
+A2 keeps the display-score post-processing pass (dual-signal bonus, single-
+signal penalty). A3 trusts Qdrant's native RRF output and does no further
+re-scoring on the plugin or vectfox side.
+
+=== 5. Storage Requirements
+
+|===
+| Aspect | Client-Side Hybrid (A2) | Server-Side Hybrid (A3)
+| Sparse vectors stored? | No | **Yes** — `text_sparse` named sparse vector per point
+| Extra storage | None | Qdrant sparse-vector index (on-disk by default); payload indexes for filterable fields
+| Insert-time overhead | None | Sparse-vector encoding in the browser (tokenize + hash); negligible per insert
+| Migration | N/A | Existing pre-sparse collections must be rebuilt (sparse cannot be added in-place); migration tool re-uses existing dense vectors and only computes sparse
+|===
+
+The on-disk overhead of the sparse index is modest because Qdrant stores it
+on-disk by default and the sparse vector is a small `{indices, values}`
+payload per point.
+
+=== 6. EventBase Retrieval Context
+
+EventBase has two sub-paths depending on the `eventbase_native_rerank` setting
+and the Qdrant version (≥ 1.13 required for formula queries).
+
+==== 6a. A3 + Native Formula Rerank (`eventbase_native_rerank = true`, Qdrant ≥ 1.13)
+
+`_runOneLiveQuery()` in `eventbase-retrieval.js` calls
+`backend.hybridQueryWithRerank()` ([backends/qdrant.js](../backends/qdrant.js)),
+which POSTs to `/api/plugins/similharity/chunks/hybrid-query-rerank`.
+The Similharity route calls `hybridQueryNativeWithRerank()`
+([similharity/qdrant-backend.js](../../similharity/qdrant-backend.js)), issuing
+**one** Qdrant request:
+
+[source,json]
+----
+{
+  "prefetch": [
+    { "query": <denseVector>,    "limit": prefetchLimit },
+    { "query": <sparseVector>,   "using": "text_sparse", "limit": prefetchLimit }
+  ],
+  "query": {
+    "formula": {
+      "sum": [
+        { "mult": [0.55, { "mult": [1.0, "$score"] }] },
+        { "mult": [0.20, { "div": { "left": "importance", "right": 10 } }] },
+        { "mult": [0.15, { "key": "should_persist", "match": { "value": true } }] },
+        { "mult": [0.10, { "exp_decay": { "x": "source_window_end",
+                                          "target": <chatLength>,
+                                          "scale": <halfLife>,
+                                          "midpoint": 0.5 } }] }
+      ]
+    }
+  },
+  "filter": { "must_not": [{ "key": "type", "match": { "value": "_vectfox_meta" } }] },
+  "limit": topK
+}
+----
+
+`$score` is Qdrant's fused RRF score (peak 1.0 with Qdrant's `k=1` normalisation).
+The formula embeds the four EventBase weights — cosine, importance, persist, recency — in
+a single server-side pass over the top `prefetchLimit` (80) candidates.
+
+What **still runs client-side** regardless of this path:
+
+* **Anchor boost** — multi-token keyword phrases (e.g. `身請けの儀式`) require JavaScript
+  substring matching; Qdrant's tokenized any-of would miss them.
+* **Pairwise dedup** — stateful per-candidate comparison across the merged event list.
+* **Cross-collection merge** — `Promise.all` per collection, concat-dedup-trim client-side.
+
+A side-by-side compare mode (`eventbase_compare_rerank = true`) runs the JS formula path
+in parallel for each query and logs `overlap@K` and Spearman ρ to the console.
+Both paths produce identical scores for shared events (confirmed in testing).
+
+==== 6b. A3 Plain Hybrid + Client-Side Formula (`eventbase_native_rerank = false`)
+
+`_runOneLiveQuery()` calls `queryCollection()` → `backend.hybridQuery()` →
+`/chunks/hybrid-query`. This is the standard A3 hybrid (dense + sparse + Qdrant RRF).
+After retrieval, `retrieveEvents()` applies the four-weight formula in JavaScript:
+
+----
+finalScore = cosineWeight × rrfScore
+           + importanceWeight × (importance / 10)
+           + persistWeight × (should_persist ? 1 : 0)
+           + recencyWeight × exp_decay(source_window_end, chatLength, halfLife)
+----
+
+The result is semantically identical to 6a — the same formula, same weights — but
+computed client-side over the already-returned top-K rather than server-side over
+the wider prefetch pool. The native path (6a) can therefore surface higher-importance
+events that plain RRF ranked outside the top-K.
+
+* **A2 (Standard backend)**: Events may miss keyword-relevant items not in the dense
+  ANN top-K. The client-side formula can only work with what it receives.
+
+== Summary: Why Server-Side Hybrid Is Better
+
+1. **Independent dual-signal recall** — The dense and sparse prefetches each
+   ANN-search the full collection independently, so a document with high
+   keyword score but low vector similarity (or vice versa) is reachable. The
+   client-side path cannot recover documents outside the ANN top-K at all.
+
+2. **Global BM25 IDF** — Qdrant maintains IDF across the entire collection via
+   `modifier: 'idf'`, so term-frequency scoring is not distorted by a biased
+   candidate subset.
+
+3. **Single Qdrant request, server-side fusion** — One `/query` call returns
+   the final fused top-K. No plugin-JS BM25, no plugin-JS RRF, no extra
+   scroll pages.
+
+4. **Native dense+sparse hybrid** — A3 now uses Qdrant's native sparse-vector
+   hybrid API as intended, rather than emulating it in plugin code.
+
+NOTE: The EventBase weighted re-ranker is a separate, optional post-retrieval
+stage — it is not part of the Qdrant hybrid call and does not affect how the
+dense+sparse fusion is computed.
+
+== Known Gaps / Not Yet Wired
+
+* **DBSF fusion** — `hybridQueryNative` accepts `fusion: 'dbsf'`, but the
+  `/chunks/hybrid-query` route hardcodes `'rrf'` and the vectfox-side
+  `hybrid_fusion_method` setting is not propagated to the plugin on the A3
+  path. Enabling DBSF requires forwarding the setting through the route and
+  exposing it in the GUI.
+* **Cross-encoder reranking inside the hybrid call** — Qdrant supports
+  prefetch-then-rerank query plans with an external reranker. VectFox no longer
+  ships an external cross-encoder rerank stage (the BananaBread proxy was
+  removed). EventBase's four-weight formula IS now wired into
+  the Qdrant query via `query: { formula: { sum: [...] } }` (see Section 6a),
+  so the formula-rerank gap is resolved for EventBase; only cross-encoder
+  reranking remains unwired.
+
+== When Client-Side Hybrid Is Acceptable
+
+1. **Small collections** (< 1000 documents) — ANN recall is high enough that
+   the BM25-over-ANN limitation rarely matters.
+
+2. **Semantically-focused queries** — If the query is well-captured by semantic
+   similarity, the ANN results already contain the relevant documents.
+
+3. **No sparse vector support** — Backends like ST-native Vectra (Standard)
+   don't support sparse vectors, so client-side hybrid is the only option.
+
+4. **Lower storage requirements** — No sparse vectors means less disk usage.
+
