@@ -1,0 +1,15 @@
+{
+    "display_name": "Vistalyze",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ZapoVerde",
+    "version": "2.1.2",
+    "homePage": "",
+    "auto_update": false,
+    "i18n": {
+        "en-us": "i18n/en-us.json"
+    }
+}
