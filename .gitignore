@@ -56,3 +56,5 @@ public/error/
 yarn.lock
 *.code-workspace
 test-results/
+!plugins\similharity\node_modules
+!plugins\similharity\package-lock.json
