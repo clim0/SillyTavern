@@ -1,0 +1,345 @@
+/**
+ * @file data/default-user/extensions/vistalyze/style.css
+ * @stamp {"utc":"2026-04-03T18:30:00.000Z"}
+ * @architectural-role UI Styling
+ * @description
+ * Primary stylesheet for Vistalyze. Handles background transitions, 
+ * workshop modal layout, and themed UI components. 
+ * Fixes "tiny modal" collapse by hardening the flex chain.
+ */
+
+/* --- Background Transitions --- */
+#bg1.vistalyze-fade-out {
+    opacity: 0 !important;
+    transition: opacity 0.3s ease-in-out !important;
+}
+
+#bg1.vistalyze-fade-in {
+    opacity: 1 !important;
+    transition: opacity 0.6s ease-in-out !important;
+}
+
+/* --- Workshop Overlay & Modal --- */
+.lz-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.75);
+    z-index: 2000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+}
+
+.lz-modal {
+    background: var(--SmartThemeBlurTintColor);
+    color: var(--SmartThemeBodyColor);
+    width: 900px;
+    max-width: 95vw;
+    height: 80vh; /* Fixed height prevents shrink-wrapping collapse */
+    min-height: 500px;
+    border-radius: 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+.lz-hidden {
+    display: none !important;
+}
+
+/* --- Header & Tabs --- */
+.lz-workshop-header {
+    padding: 15px 20px;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid var(--SmartThemeBorderColor);
+    flex-shrink: 0;
+}
+
+.lz-tab-bar {
+    display: flex;
+    gap: 10px;
+    margin-top: 10px;
+}
+
+.lz-tab-btn {
+    background: transparent;
+    border: 1px solid var(--SmartThemeBorderColor);
+    color: var(--SmartThemeBodyColor);
+    padding: 6px 15px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.9em;
+    transition: all 0.2s;
+}
+
+.lz-tab-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.lz-tab-btn.lz-active {
+    background: var(--SmartThemeQuoteColor);
+    border-color: var(--SmartThemeQuoteColor);
+    color: white;
+}
+
+/* --- Content Panels --- */
+.lz-workshop-body {
+    flex: 1; /* Occupies all space between header and footer */
+    display: flex; /* Critical: Must be a flex container for panels */
+    flex-direction: column;
+    overflow: hidden;
+    min-height: 0; /* Prevents flex-child from expanding beyond parent */
+}
+
+.lz-tab-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding: 20px;
+}
+
+/* --- Library View --- */
+.lz-library-list {
+    flex: 1; /* Fills the panel space to enable scrolling */
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    overflow-y: auto;
+}
+
+.lz-library-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.15);
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: default;
+    transition: border-color 0.2s;
+}
+
+.lz-library-item:hover {
+    border-color: var(--SmartThemeBorderColor);
+}
+
+.lz-library-item.lz-active-loc {
+    border-left: 4px solid var(--SmartThemeQuoteColor);
+    background: rgba(var(--SmartThemeQuoteColor-rgb), 0.1);
+}
+
+.lz-lib-text {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+}
+
+.lz-lib-text small {
+    opacity: 0.6;
+    font-size: 0.85em;
+    margin-top: 2px;
+}
+
+.lz-lib-actions {
+    display: flex;
+    gap: 15px;
+    font-size: 1.1em;
+    opacity: 0.5;
+}
+
+.lz-lib-actions i {
+    cursor: pointer;
+    transition: opacity 0.2s, color 0.2s;
+}
+
+.lz-lib-actions i:hover {
+    opacity: 1;
+}
+
+.lz-lib-apply:hover { color: var(--SmartThemeQuoteColor); }
+.lz-lib-edit:hover { color: #3498db; }
+.lz-lib-delete:hover { color: var(--SmartThemeErrorColor); }
+
+/* --- Library Thumbnails --- */
+.lz-lib-thumb {
+    width: 80px;
+    min-width: 80px;
+    max-width: 80px;
+    height: 45px;
+    flex-shrink: 0;
+    border-radius: 4px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor);
+    margin-right: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: border-color 0.2s, opacity 0.2s;
+}
+
+.lz-lib-thumb:hover {
+    border-color: var(--SmartThemeQuoteColor);
+    opacity: 0.85;
+}
+
+.lz-lib-thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.lz-thumb-placeholder {
+    opacity: 0.25;
+    font-size: 1.2em;
+}
+
+/* --- Settings Body --- */
+/* Single indent rule for all VLZ settings content. */
+.lz-settings-body {
+    padding-left: 8px;
+}
+
+/* Left accent border only on expanded step/section content, not the header bar.
+   Hidden automatically when collapsed since content is display:none. */
+.lz-call-row > .inline-drawer-content {
+    border-left: 3px solid var(--SmartThemeQuoteColor, #f5a623);
+    padding-left: 10px;
+}
+
+/* --- Background Lightbox --- */
+.lz-bg-lightbox {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 2100;
+    background: rgba(0, 0, 0, 0.92);
+    cursor: zoom-out;
+}
+
+.lz-bg-lightbox img {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    max-width: 100vw;
+    max-height: 100dvh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+}
+
+/* --- Architect Layout --- */
+.lz-architect-fields {
+    display: flex;
+    flex-direction: column;
+}
+
+.lz-architect-fields > label {
+    display: block;
+    margin: 12px 0 4px;
+    font-size: 0.85em;
+    opacity: 0.8;
+}
+
+.lz-regen-spark {
+    margin-left: 5px;
+    cursor: pointer;
+    color: var(--SmartThemeQuoteColor);
+}
+
+.lz-architect-actions {
+    margin-top: 15px;
+}
+
+.lz-preview-pane {
+    display: flex;
+    flex-direction: row;
+    gap: 15px;
+    margin-top: 20px;
+    flex-shrink: 0;
+}
+
+.lz-preview-box {
+    flex: 1;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 5px;
+    padding: 5px;
+    position: relative;
+    aspect-ratio: 16 / 9;
+}
+
+.lz-preview-box small {
+    position: absolute;
+    top: 5px;
+    left: 8px;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.7em;
+    z-index: 2;
+}
+
+.lz-preview-box img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: 3px;
+}
+
+#lz-preview-spinner {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 2em;
+    z-index: 10;
+}
+
+/* --- Footer & Controls --- */
+.lz-workshop-footer {
+    padding: 15px 20px;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+    display: flex;
+    justify-content: flex-end;
+    flex-shrink: 0;
+}
+
+.lz-workshop-controls {
+    padding: 10px 20px 20px;
+    display: flex;
+    justify-content: space-between; /* Pushes select-existing left, group right */
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+}
+
+.lz-footer-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.lz-primary-action {
+    background-color: var(--SmartThemeErrorColor) !important;
+    color: white !important;
+    border: none !important;
+    font-weight: bold !important;
+}
+
+.lz-primary-action:hover {
+    filter: brightness(1.2);
+}
